@@ -1,0 +1,504 @@
+"""
+Mesh Checker & Component Inspector - Maya 2022 (PySide2)
+========================================================
+
+Scans selected polygonal meshes for geometric errors, allows component 
+stepping/framing, provides quick-fix options, and prints detailed activity logs.
+
+Install / Run:
+    Paste into Maya Script Editor (Python tab) and execute.
+"""
+
+from __future__ import print_function
+
+import time
+import maya.cmds as cmds
+import maya.OpenMayaUI as omui
+import maya.api.OpenMaya as om
+from PySide2 import QtCore, QtGui, QtWidgets
+from shiboken2 import wrapInstance
+
+
+def get_maya_main_window():
+    """Return the Maya main window as a PySide2 QWidget."""
+    ptr = omui.MQtUtil.mainWindow()
+    if ptr is None:
+        return None
+    return wrapInstance(int(ptr), QtWidgets.QWidget)
+
+
+class MeshCheckerUI(QtWidgets.QDialog):
+    """Maya UI for scanning, stepping through, and fixing mesh geometry errors."""
+
+    def __init__(self, parent=None):
+        if parent is None:
+            parent = get_maya_main_window()
+        super(MeshCheckerUI, self).__init__(parent)
+
+        self.setWindowTitle("Mesh Geometry Inspector - Maya 2022")
+        self.setMinimumWidth(540)
+        self.setMinimumHeight(720)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
+
+        self.issue_data = {}  # Format: {"Category Name": [component_strings]}
+        self.active_mesh = None
+
+        self.create_widgets()
+        self.create_layout()
+        self.create_connections()
+        self.log_message("Tool initialized. Select a polygon mesh and click 'Scan Selected Mesh'.")
+
+    # -- UI Setup -----------------------------------------------------------
+
+    def create_widgets(self):
+        self.header_label = QtWidgets.QLabel("Mesh Geometry Inspector & Fixer")
+        self.header_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+
+        self.desc_label = QtWidgets.QLabel(
+            "Select a mesh and scan. Click items to highlight and frame them. "
+            "Use the 'Fix Selected' button to auto-repair targeted issues."
+        )
+        self.desc_label.setWordWrap(True)
+        self.desc_label.setStyleSheet("color: #aaaaaa;")
+
+        # Scan Configuration Checkboxes
+        self.check_ngons_cb = QtWidgets.QCheckBox("N-Gons (> 4 Vertices)")
+        self.check_ngons_cb.setChecked(True)
+
+        self.check_nonmanifold_cb = QtWidgets.QCheckBox("Non-Manifold Geometry")
+        self.check_nonmanifold_cb.setChecked(True)
+
+        self.check_zero_area_cb = QtWidgets.QCheckBox("Zero-Area / Degenerate Faces")
+        self.check_zero_area_cb.setChecked(True)
+
+        self.check_lamina_cb = QtWidgets.QCheckBox("Lamina Faces (Overlapping)")
+        self.check_lamina_cb.setChecked(True)
+
+        self.check_concave_cb = QtWidgets.QCheckBox("Concave Faces")
+        self.check_concave_cb.setChecked(False)
+
+        self.check_holes_cb = QtWidgets.QCheckBox("Faces with Holes")
+        self.check_holes_cb.setChecked(True)
+
+        self.scan_btn = QtWidgets.QPushButton("Scan Selected Mesh")
+        self.scan_btn.setStyleSheet(
+            "background-color: #5285a6; color: white; font-weight: bold; padding: 8px;"
+        )
+
+        # Component List Tree & Context Menu
+        self.tree_widget = QtWidgets.QTreeWidget()
+        self.tree_widget.setHeaderLabels(["Issue Category / Component", "Count"])
+        self.tree_widget.setColumnWidth(0, 320)
+        self.tree_widget.setAlternatingRowColors(True)
+        self.tree_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+
+        # Fix Controls
+        self.fix_btn = QtWidgets.QPushButton("Fix Selected Issue")
+        self.fix_btn.setStyleSheet(
+            "background-color: #43a047; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.fix_btn.setToolTip("Attempts to automatically fix the selected issue or category.")
+
+        self.auto_frame_cb = QtWidgets.QCheckBox("Auto-Frame Viewport")
+        self.auto_frame_cb.setChecked(True)
+
+        # Log Output Box
+        self.log_text = QtWidgets.QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(140)
+        self.log_text.setStyleSheet(
+            "background-color: #1e1e1e; color: #dcdcdc; font-family: Consolas, Monospace; font-size: 11px;"
+        )
+
+        self.clear_log_btn = QtWidgets.QPushButton("Clear Log")
+        self.clear_log_btn.setMaximumWidth(80)
+
+        self.status_label = QtWidgets.QLabel("Ready to scan.")
+        self.status_label.setStyleSheet("color: #bbbbbb;")
+
+    def create_layout(self):
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setSpacing(8)
+
+        main_layout.addWidget(self.header_label)
+        main_layout.addWidget(self.desc_label)
+
+        # Checks Group
+        checks_group = QtWidgets.QGroupBox("Scan Tests")
+        checks_layout = QtWidgets.QGridLayout(checks_group)
+        checks_layout.addWidget(self.check_ngons_cb, 0, 0)
+        checks_layout.addWidget(self.check_nonmanifold_cb, 0, 1)
+        checks_layout.addWidget(self.check_zero_area_cb, 1, 0)
+        checks_layout.addWidget(self.check_lamina_cb, 1, 1)
+        checks_layout.addWidget(self.check_concave_cb, 2, 0)
+        checks_layout.addWidget(self.check_holes_cb, 2, 1)
+        main_layout.addWidget(checks_group)
+
+        main_layout.addWidget(self.scan_btn)
+
+        # Results & Fix Action Group
+        results_group = QtWidgets.QGroupBox("Detected Issues")
+        results_layout = QtWidgets.QVBoxLayout(results_group)
+
+        # Tree + Action Row
+        tree_action_row = QtWidgets.QHBoxLayout()
+        tree_action_row.addWidget(self.tree_widget, stretch=1)
+
+        side_btn_layout = QtWidgets.QVBoxLayout()
+        side_btn_layout.addWidget(self.fix_btn)
+        side_btn_layout.addStretch()
+        tree_action_row.addLayout(side_btn_layout)
+
+        results_layout.addLayout(tree_action_row)
+        results_layout.addWidget(self.auto_frame_cb)
+        main_layout.addWidget(results_group, stretch=1)
+
+        # Activity Log Group
+        log_group = QtWidgets.QGroupBox("Execution Log")
+        log_layout = QtWidgets.QVBoxLayout(log_group)
+        log_layout.addWidget(self.log_text)
+
+        log_bar = QtWidgets.QHBoxLayout()
+        log_bar.addWidget(self.status_label, stretch=1)
+        log_bar.addWidget(self.clear_log_btn)
+        log_layout.addLayout(log_bar)
+
+        main_layout.addWidget(log_group)
+
+    def create_connections(self):
+        self.scan_btn.clicked.connect(self.run_mesh_scan)
+        self.tree_widget.itemSelectionChanged.connect(self.on_item_selected)
+        self.tree_widget.customContextMenuRequested.connect(self.show_context_menu)
+        self.fix_btn.clicked.connect(self.fix_selected_issue)
+        self.clear_log_btn.clicked.connect(self.log_text.clear)
+
+    # -- Logging Helper ------------------------------------------------------
+
+    def log_message(self, message, level="INFO"):
+        """Appends a timestamped log entry to the UI log box and Maya Script Editor."""
+        timestamp = time.strftime("%H:%M:%S")
+        entry = "[{0}] [{1}] {2}".format(timestamp, level, message)
+        self.log_text.appendPlainText(entry)
+
+        sb = self.log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+        print("MeshChecker: {0}".format(entry))
+
+    # -- Selection & Target Normalization -----------------------------------
+
+    def _get_target_mesh(self):
+        """Resolves active selection to a valid polygonal mesh shape node."""
+        sel = cmds.ls(selection=True, long=True) or []
+        if not sel:
+            return None, None
+
+        first_sel = sel[0]
+        node_type = cmds.nodeType(first_sel)
+
+        # If user selected a component (e.g. pCube1.f[0]), extract parent transform/mesh
+        if "." in first_sel:
+            first_sel = first_sel.split(".")[0]
+            node_type = cmds.nodeType(first_sel)
+
+        if node_type == "transform":
+            shapes = cmds.listRelatives(first_sel, shapes=True, type="mesh", fullPath=True) or []
+            if shapes:
+                return first_sel, shapes[0]
+        elif node_type == "mesh":
+            parents = cmds.listRelatives(first_sel, parent=True, type="transform", fullPath=True) or []
+            transform_node = parents[0] if parents else first_sel
+            return transform_node, first_sel
+
+        return None, None
+
+    # -- Geometry Scanning Logic ---------------------------------------------
+
+    def run_mesh_scan(self):
+        """Scans the target polygon mesh using OpenMaya / Maya Python flags."""
+        transform_node, mesh_shape = self._get_target_mesh()
+
+        if not mesh_shape:
+            self._set_status("Error: Please select a polygonal mesh object.", "error")
+            self.log_message("Scan aborted: No valid polygon mesh found in active selection.", "WARN")
+            cmds.warning("Please select a polygonal mesh object to scan.")
+            return
+
+        self.active_mesh = mesh_shape
+        self.tree_widget.clear()
+        self.issue_data.clear()
+
+        self.log_message("--- Scanning Object: {0} ---".format(transform_node))
+
+        total_issues = 0
+
+        # Switch Maya to Object Mode temporarily to prevent selection mask bugs
+        cmds.selectMode(object=True)
+
+        try:
+            m_selection = om.MSelectionList()
+            m_selection.add(self.active_mesh)
+            dag_path = m_selection.getDagPath(0)
+            poly_iter = om.MItMeshPolygon(dag_path)
+        except Exception as exc:
+            self.log_message("OpenMaya initialization failed: {0}".format(exc), "ERROR")
+            return
+
+        # 1. N-Gons (> 4 Vertices)
+        if self.check_ngons_cb.isChecked():
+            ngon_faces = []
+            poly_iter.reset()
+            while not poly_iter.isDone():
+                if poly_iter.vertexCount() > 4:
+                    ngon_faces.append("{0}.f[{1}]".format(self.active_mesh, poly_iter.index()))
+                poly_iter.next()
+
+            if ngon_faces:
+                self.issue_data["N-Gons (> 4 Vertices)"] = ngon_faces
+                total_issues += len(ngon_faces)
+                self.log_message("Found {0} N-Gons (> 4 verts)".format(len(ngon_faces)), "DETECTED")
+
+        # 2. Non-Manifold Vertices & Edges
+        if self.check_nonmanifold_cb.isChecked():
+            nm_verts = cmds.polyInfo(self.active_mesh, nonManifoldVertices=True) or []
+            nm_edges = cmds.polyInfo(self.active_mesh, nonManifoldEdges=True) or []
+            nm_comps = cmds.ls(nm_verts + nm_edges, flatten=True) or []
+            if nm_comps:
+                self.issue_data["Non-Manifold Geometry"] = nm_comps
+                total_issues += len(nm_comps)
+                self.log_message("Found {0} Non-Manifold elements".format(len(nm_comps)), "DETECTED")
+
+        # 3. Zero-Area / Degenerate Faces
+        if self.check_zero_area_cb.isChecked():
+            zero_faces = []
+            poly_iter.reset()
+            while not poly_iter.isDone():
+                if poly_iter.getArea() <= 1e-06:
+                    zero_faces.append("{0}.f[{1}]".format(self.active_mesh, poly_iter.index()))
+                poly_iter.next()
+
+            if zero_faces:
+                self.issue_data["Zero-Area / Degenerate Faces"] = zero_faces
+                total_issues += len(zero_faces)
+                self.log_message("Found {0} Zero-Area/Degenerate faces".format(len(zero_faces)), "DETECTED")
+
+        # 4. Lamina Faces
+        if self.check_lamina_cb.isChecked():
+            lamina = cmds.polyInfo(self.active_mesh, laminaFaces=True) or []
+            lamina_comps = cmds.ls(lamina, flatten=True) or []
+            if lamina_comps:
+                self.issue_data["Lamina Faces"] = lamina_comps
+                total_issues += len(lamina_comps)
+                self.log_message("Found {0} Lamina faces".format(len(lamina_comps)), "DETECTED")
+
+        # 5. Concave Faces
+        if self.check_concave_cb.isChecked():
+            concave_faces = []
+            poly_iter.reset()
+            while not poly_iter.isDone():
+                if not poly_iter.isConvex():
+                    concave_faces.append("{0}.f[{1}]".format(self.active_mesh, poly_iter.index()))
+                poly_iter.next()
+
+            if concave_faces:
+                self.issue_data["Concave Faces"] = concave_faces
+                total_issues += len(concave_faces)
+                self.log_message("Found {0} Concave faces".format(len(concave_faces)), "DETECTED")
+
+        # 6. Faces with Holes
+        if self.check_holes_cb.isChecked():
+            hole_faces = []
+            poly_iter.reset()
+            while not poly_iter.isDone():
+                if poly_iter.hasHoles():
+                    hole_faces.append("{0}.f[{1}]".format(self.active_mesh, poly_iter.index()))
+                poly_iter.next()
+
+            if hole_faces:
+                self.issue_data["Faces with Holes"] = hole_faces
+                total_issues += len(hole_faces)
+                self.log_message("Found {0} Faces with holes".format(len(hole_faces)), "DETECTED")
+
+        self._populate_tree()
+
+        if total_issues == 0:
+            self._set_status("Scan complete: No geometry issues found!", "ok")
+            self.log_message("Scan finished: Clean mesh! No issues detected.")
+        else:
+            self._set_status(
+                "Scan complete: Found {0} issue(s) across {1} categories.".format(
+                    total_issues, len(self.issue_data)
+                ),
+                "warn",
+            )
+            self.log_message("Scan finished. Total issues detected: {0}".format(total_issues), "SUMMARY")
+
+    def _populate_tree(self):
+        """Populate UI TreeWidget with scan results."""
+        red_brush = QtGui.QBrush(QtGui.QColor("#e57373"))
+
+        for category, comps in self.issue_data.items():
+            category_item = QtWidgets.QTreeWidgetItem(self.tree_widget)
+            category_item.setText(0, category)
+            category_item.setText(1, str(len(comps)))
+            category_item.setForeground(0, red_brush)
+            category_item.setForeground(1, red_brush)
+            category_item.setExpanded(True)
+
+            for comp in comps[:500]:
+                child_item = QtWidgets.QTreeWidgetItem(category_item)
+                child_item.setText(0, comp)
+                child_item.setData(0, QtCore.Qt.UserRole, comp)
+
+            if len(comps) > 500:
+                more_item = QtWidgets.QTreeWidgetItem(category_item)
+                more_item.setText(0, "... ({0} more hidden)".format(len(comps) - 500))
+
+    # -- Selection & Framing Logic -------------------------------------------
+
+    def on_item_selected(self):
+        """Handles component selection in viewport."""
+        selected_items = self.tree_widget.selectedItems()
+        if not selected_items:
+            return
+
+        item = selected_items[0]
+        comp_str = item.data(0, QtCore.Qt.UserRole)
+
+        if comp_str and cmds.objExists(comp_str):
+            cmds.select(comp_str, replace=True)
+            self.log_message("Selected component: {0}".format(comp_str), "VIEWPORT")
+        elif item.parent() is None:
+            category_name = item.text(0)
+            comps = self.issue_data.get(category_name, [])
+            valid_comps = [c for c in comps if cmds.objExists(c)]
+            if valid_comps:
+                cmds.select(valid_comps, replace=True)
+                self.log_message(
+                    "Selected category '{0}' ({1} elements)".format(category_name, len(valid_comps)), "VIEWPORT"
+                )
+
+        if self.auto_frame_cb.isChecked():
+            cmds.viewFit(activeView=True)
+
+    def show_context_menu(self, position):
+        """Right-click menu for direct fixing from the tree list."""
+        item = self.tree_widget.itemAt(position)
+        if not item:
+            return
+
+        menu = QtWidgets.QMenu(self)
+        fix_action = menu.addAction("Fix Selected Issue")
+        action = menu.exec_(self.tree_widget.mapToGlobal(position))
+        if action == fix_action:
+            self.fix_selected_issue()
+
+    # -- Repair Logic --------------------------------------------------------
+
+    def fix_selected_issue(self):
+        """Applies automatic repairs using direct Maya Python commands."""
+        selected_items = self.tree_widget.selectedItems()
+        if not selected_items:
+            self._set_status("Select an issue in the list to fix.", "warn")
+            self.log_message("Fix aborted: No item selected in the tree list.", "WARN")
+            return
+
+        item = selected_items[0]
+        category_name = item.text(0) if item.parent() is None else item.parent().text(0)
+        comp_str = item.data(0, QtCore.Qt.UserRole)
+
+        transform_node, _ = self._get_target_mesh()
+        if not transform_node:
+            self._set_status("Mesh transform missing or invalid.", "error")
+            self.log_message("Fix aborted: Mesh transform node missing or invalid.", "ERROR")
+            return
+
+        self.log_message("Attempting repair for '{0}' on '{1}'...".format(category_name, transform_node), "ACTION")
+
+        cmds.undoInfo(openChunk=True, chunkName="Fix Mesh Issue")
+        try:
+            # 1. Triangulate Faces (N-Gons, Concave, Holes)
+            if category_name in ("N-Gons (> 4 Vertices)", "Concave Faces", "Faces with Holes"):
+                target = [comp_str] if comp_str else self.issue_data.get(category_name, [])
+                valid_target = [c for c in target if cmds.objExists(c)]
+                if valid_target:
+                    cmds.polyTriangulate(valid_target)
+                    self.log_message("Triangulated {0} face(s).".format(len(valid_target)), "SUCCESS")
+
+            # 2. Cleanup Non-Manifold Geometry
+            elif category_name == "Non-Manifold Geometry":
+                cmds.polyCleanup(
+                    transform_node,
+                    cleaning=True,
+                    nonManifold=True,
+                    length=True,
+                    l=1e-05,
+                )
+                self.log_message("Executed non-manifold polygon cleanup.", "SUCCESS")
+
+            # 3. Cleanup Zero-Area / Degenerate Faces
+            elif category_name == "Zero-Area / Degenerate Faces":
+                cmds.polyCleanup(
+                    transform_node,
+                    cleaning=True,
+                    zeroArea=True,
+                    zeroAreaTol=1e-05,
+                )
+                self.log_message("Executed zero-area face cleanup.", "SUCCESS")
+
+            # 4. Cleanup Lamina Faces
+            elif category_name == "Lamina Faces":
+                cmds.polyCleanup(
+                    transform_node,
+                    cleaning=True,
+                    lamina=True,
+                )
+                self.log_message("Executed lamina face cleanup.", "SUCCESS")
+
+            self._set_status("Applied fix for '{0}'!".format(category_name), "ok")
+
+        except Exception as exc:
+            self._set_status("Fix failed: {0}".format(exc), "error")
+            self.log_message("Fix failed with error: {0}".format(exc), "ERROR")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        # Re-select object and refresh scan
+        cmds.selectMode(object=True)
+        cmds.select(transform_node, replace=True)
+        self.run_mesh_scan()
+
+    # -- Helpers -------------------------------------------------------------
+
+    def _set_status(self, text, level="info"):
+        colors = {
+            "info": "#bbbbbb",
+            "ok": "#81c784",
+            "warn": "#ffb74d",
+            "error": "#e57373",
+        }
+        self.status_label.setStyleSheet("color: {0};".format(colors.get(level, "#bbbbbb")))
+        self.status_label.setText(text)
+
+
+# -- Launch -----------------------------------------------------------------
+
+_mesh_checker_win = None
+
+def show_gui():
+    """Show a single instance of the Mesh Checker dialog."""
+    global _mesh_checker_win
+    try:
+        if _mesh_checker_win is not None:
+            _mesh_checker_win.close()
+            _mesh_checker_win.deleteLater()
+    except (RuntimeError, ReferenceError, AttributeError):
+        pass
+
+    _mesh_checker_win = MeshCheckerUI()
+    _mesh_checker_win.show()
+    return _mesh_checker_win
+
+
+if __name__ == "__main__":
+    show_gui()
